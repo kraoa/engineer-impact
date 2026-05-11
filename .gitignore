@@ -1,0 +1,12 @@
+.venv/
+local_testrepo/
+events.jsonl
+metrics.csv
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+*.egg-info/
+dist/
+coverage.xml
