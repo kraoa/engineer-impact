@@ -23,47 +23,55 @@ def main():
         print('No events found in', inp)
         return
     df = pd.DataFrame(rows)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df = df.sort_values('timestamp')
 
-    # Identify first introduction of each (file,function)
-    first = df.sort_values('timestamp').groupby(['file', 'function']).first().reset_index()
+    # First introduction of each (file, function)
+    first = df.groupby(['file', 'function']).first().reset_index()
     first = first.rename(columns={'commit': 'created_commit', 'author': 'creator', 'timestamp': 'created_at'})
 
-    # Count future distinct commits that modify the same function within 90 days
-    def future_mod_count(row):
-        mask = (
-            (df['file'] == row['file']) &
-            (df['function'] == row['function']) &
-            (df['timestamp'] > row['created_at']) &
-            (df['timestamp'] <= row['created_at'] + pd.Timedelta(days=90))
-        )
-        return df[mask]['commit'].nunique()
+    # Merge introduction time back onto all events
+    merged = df.merge(first[['file', 'function', 'created_at']], on=['file', 'function'])
+    merged['days_after'] = (merged['timestamp'] - merged['created_at']).dt.days
 
-    first['future_mods_90d'] = first.apply(future_mod_count, axis=1)
+    # Only events that came after the introduction
+    subsequent = merged[merged['days_after'] > 0].copy()
 
-    # Survivability = days until first modification (or capped at 90)
-    def survivability_days(row):
-        mask = (
-            (df['file'] == row['file']) &
-            (df['function'] == row['function']) &
-            (df['timestamp'] > row['created_at'])
-        )
-        sub = df[mask].sort_values('timestamp')
-        if sub.empty:
-            return 90
-        return (sub.iloc[0]['timestamp'] - row['created_at']).days
+    # Future distinct commits within 90 days
+    mods_90d = (
+        subsequent[subsequent['days_after'] <= 90]
+        .groupby(['file', 'function'])['commit']
+        .nunique()
+        .reset_index()
+        .rename(columns={'commit': 'future_mods_90d'})
+    )
 
-    first['survivability_days'] = first.apply(survivability_days, axis=1)
+    # Survivability: days until first modification (capped at 90 if never touched)
+    surv = (
+        subsequent.sort_values('days_after')
+        .groupby(['file', 'function'])['days_after']
+        .first()
+        .reset_index()
+        .rename(columns={'days_after': 'survivability_days'})
+    )
 
-    # Aggregate per creator
+    first = first.merge(mods_90d, on=['file', 'function'], how='left')
+    first = first.merge(surv, on=['file', 'function'], how='left')
+    first['future_mods_90d'] = first['future_mods_90d'].fillna(0).astype(int)
+    first['survivability_days'] = first['survivability_days'].fillna(90)
+
+    # Aggregate per author
     agg = first.groupby('creator').agg(
         introduced_functions=('function', 'count'),
         total_future_mods_90d=('future_mods_90d', 'sum'),
         median_survivability=('survivability_days', 'median')
     ).reset_index()
 
-    # Impact score: downstream mods scaled by introduced functions and survivability
-    agg['impact_score'] = agg['total_future_mods_90d'] * np.log1p(agg['introduced_functions']) + agg['median_survivability'] / 90.0
+    # Impact score: downstream mods scaled by breadth of authorship + survivability bonus
+    agg['impact_score'] = (
+        agg['total_future_mods_90d'] * np.log1p(agg['introduced_functions'])
+        + agg['median_survivability'] / 90.0
+    )
 
     agg = agg.sort_values('impact_score', ascending=False)
     out.parent.mkdir(parents=True, exist_ok=True)
